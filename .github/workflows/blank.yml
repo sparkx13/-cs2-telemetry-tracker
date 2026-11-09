@@ -1,0 +1,1085 @@
+from demoparser2 import DemoParser
+import pandas as pd
+import numpy as np
+
+TRADE_WINDOW_SECONDS = 5.0
+TICK_RATE = 64.0  # CS2 subtick servers record demos at 64 ticks/sec
+
+class CS2DemoAnalyzer:
+    def __init__(self, demo_path: str):
+        self.parser = DemoParser(demo_path)
+
+    def parse_full_map_telemetry(self) -> pd.DataFrame:
+        # 1. Extract Kills & Filter Warmup
+        kills = self.parser.parse_event(
+            "player_death",
+            player=["X", "Y", "team_name"],
+            other=["total_rounds_played", "is_warmup_period"]
+        )
+        kills = kills[~kills["is_warmup_period"]].copy()
+        kills.sort_values("tick", inplace=True)
+
+        # 2. Extract Damage & Cap Health Damage at 100
+        hurts = self.parser.parse_event(
+            "player_hurt",
+            other=["total_rounds_played", "is_warmup_period"]
+        )
+        hurts = hurts[~hurts["is_warmup_period"]].copy()
+        hurts["dmg_capped"] = hurts["dmg_health"].clip(upper=100)
+
+        rounds = sorted(kills["total_rounds_played"].unique())
+        num_rounds = len(rounds)
+
+        # Gather unique players by 64-bit SteamID
+        players = pd.concat([
+            kills[["attacker_steamid", "attacker_name"]].rename(
+                columns={"attacker_steamid": "steamid", "attacker_name": "name"}
+            ),
+            kills[["user_steamid", "user_name"]].rename(
+                columns={"user_steamid": "steamid", "user_name": "name"}
+            )
+        ]).dropna().drop_duplicates(subset=["steamid"])
+        players = players[players["steamid"] != "0"]
+
+        player_ids = players["steamid"].tolist()
+
+        # Initialize trackers
+        first_kills = {pid: 0 for pid in player_ids}
+        first_deaths = {pid: 0 for pid in player_ids}
+        traded_deaths = {pid: 0 for pid in player_ids}
+        kast_rounds = {pid: 0 for pid in player_ids}
+
+        # 3. Round-by-Round KAST, Trade, and Opening Duel Engine
+        for r in rounds:
+            r_kills = kills[kills["total_rounds_played"] == r].sort_values("tick")
+            if r_kills.empty:
+                continue
+
+            # Opening Duel: First kill event of the round
+            opener = r_kills.iloc[0]
+            if opener["attacker_steamid"] in first_kills:
+                first_kills[opener["attacker_steamid"]] += 1
+            if opener["user_steamid"] in first_deaths:
+                first_deaths[opener["user_steamid"]] += 1
+
+            # Determine Trade Kills (Killer dies within 5 seconds / 320 ticks)
+            traded_victims_this_round = set()
+            kill_records = r_kills.to_dict("records")
+            for i, d_event in enumerate(kill_records):
+                victim = d_event["user_steamid"]
+                killer = d_event["attacker_steamid"]
+                death_tick = d_event["tick"]
+
+                for j in range(i + 1, len(kill_records)):
+                    subsequent = kill_records[j]
+                    if (subsequent["tick"] - death_tick) > (TRADE_WINDOW_SECONDS * TICK_RATE):
+                        break
+                    if subsequent["user_steamid"] == killer:
+                        traded_victims_this_round.add(victim)
+                        if victim in traded_deaths:
+                            traded_deaths[victim] += 1
+                        break
+
+            # Evaluate K-A-S-T for every player in round `r`
+            r_killers = set(r_kills["attacker_steamid"].dropna())
+            r_assisters = set(r_kills["assister_steamid"].dropna())
+            r_victims = set(r_kills["user_steamid"].dropna())
+
+            for pid in player_ids:
+                got_kill = pid in r_killers
+                got_assist = pid in r_assisters
+                survived = pid not in r_victims
+                was_traded = pid in traded_victims_this_round
+
+                if got_kill or got_assist or survived or was_traded:
+                    kast_rounds[pid] += 1
+
+        # 4. Aggregate Totals & Compute HLTV 2.0 Rating
+        tot_kills = kills.groupby("attacker_steamid").size()
+        tot_deaths = kills.groupby("user_steamid").size()
+        tot_assists = kills.groupby("assister_steamid").size()
+        tot_dmg = hurts.groupby("attacker_steamid")["dmg_capped"].sum()
+
+        rows = []
+        for _, p in players.iterrows():
+            pid = p["steamid"]
+            k = int(tot_kills.get(pid, 0))
+            d = int(tot_deaths.get(pid, 0))
+            a = int(tot_assists.get(pid, 0))
+            dmg = float(tot_dmg.get(pid, 0.0))
+
+            kpr = k / num_rounds
+            dpr = d / num_rounds
+            apr = a / num_rounds
+            adr = dmg / num_rounds
+            kast_pct = (kast_rounds[pid] / num_rounds) * 100.0
+
+            # HLTV 2.0 Formula
+            impact = (2.13 * kpr) + (0.42 * apr) - 0.41
+            rating_2_0 = (
+                (0.0073 * kast_pct)
+                + (0.3591 * kpr)
+                - (0.5329 * dpr)
+                + (0.2372 * impact)
+                + (0.0032 * adr)
+                + 0.1587
+            )
+
+            rows.append({
+                "steam_id_64": pid,
+                "nickname": p["name"],
+                "kills": k,
+                "deaths": d,
+                "assists": a,
+                "first_kills": first_kills[pid],
+                "first_deaths": first_deaths[pid],
+                "traded_deaths": traded_deaths[pid],
+                "adr": round(adr, 2),
+                "kast_pct": round(kast_pct, 2),
+                "impact": round(impact, 2),
+                "rating_2_0": round(rating_2_0, 2)
+            })
+
+        return pd.DataFrame(rows).sort_values("rating_2_0", ascending=False)
+
+import os
+import glob
+import shutil
+import tempfile
+import zstandard as zstd
+import patoolib
+import psycopg2
+from curl_cffi import requests
+from demo_engine import CS2DemoAnalyzer
+
+class DemoIngestionPipeline:
+    def __init__(self, db_dsn: str, proxy_url: str = None):
+        self.db_dsn = db_dsn
+        self.session = requests.Session(impersonate="chrome124")
+        if proxy_url:
+            self.session.proxies = {"http": proxy_url, "https": proxy_url}
+
+    def download_and_extract_demos(self, demo_url: str, extract_dir: str) -> list[str]:
+        """Streams the HLTV demo archive and extracts all .dem files."""
+        resp = self.session.get(demo_url, stream=True, allow_redirects=True, timeout=120)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Demo download failed ({resp.status_code}): {demo_url}")
+
+        final_url = str(resp.url)
+        ext = ".rar"
+        if ".zst" in final_url:
+            ext = ".dem.zst"
+        elif ".zip" in final_url:
+            ext = ".zip"
+
+        archive_path = os.path.join(extract_dir, f"match_archive{ext}")
+        with open(archive_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+        if ext == ".dem.zst":
+            out_dem = os.path.join(extract_dir, "map_1.dem")
+            dctx = zstd.ZstdDecompressor()
+            with open(archive_path, "rb") as ifh, open(out_dem, "wb") as ofh:
+                dctx.copy_stream(ifh, ofh)
+        else:
+            patoolib.extract_archive(archive_path, outdir=extract_dir, verbosity=-1)
+
+        os.remove(archive_path)
+        return sorted(glob.glob(os.path.join(extract_dir, "**", "*.dem"), recursive=True))
+
+    def process_match_demos(self, match_uuid: str, demo_url: str):
+        """Full pipeline: Download -> Extract -> Parse ticks -> Upsert to Postgres."""
+        work_dir = tempfile.mkdtemp(prefix="cs2_demo_")
+        try:
+            dem_files = self.download_and_extract_demos(demo_url, work_dir)
+            print(f"Extracted {len(dem_files)} .dem files for match {match_uuid}")
+
+            with psycopg2.connect(self.db_dsn) as conn:
+                with conn.cursor() as cur:
+                    for idx, dem_path in enumerate(dem_files, start=1):
+                        analyzer = CS2DemoAnalyzer(dem_path)
+                        header = analyzer.parser.parse_header()
+                        map_name = header.get("map_name", f"map_{idx}").replace("de_", "")
+
+                        stats_df = analyzer.parse_full_map_telemetry()
+
+                        cur.execute("""
+                            INSERT INTO match_maps (match_id, map_number, map_name)
+                            VALUES (%s, %s, %s)
+                            RETURNING map_id;
+                        """, (match_uuid, idx, map_name))
+                        map_id = cur.fetchone()[0]
+
+                        for _, row in stats_df.iterrows():
+                            steam_id_int = int(row["steam_id_64"])
+                            cur.execute("""
+                                INSERT INTO players (steam_id_64, nickname)
+                                VALUES (%s, %s)
+                                ON CONFLICT (steam_id_64) DO UPDATE
+                                SET nickname = EXCLUDED.nickname
+                                RETURNING player_id;
+                            """, (steam_id_int, row["nickname"]))
+                            player_uuid = cur.fetchone()[0]
+
+                            cur.execute("""
+                                INSERT INTO player_map_stats (
+                                    map_id, player_id, kills, deaths, assists,
+                                    first_kills, first_deaths, traded_deaths,
+                                    adr, kast_pct, impact_rating, rating_2_0
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (map_id, player_id) DO NOTHING;
+                            """, (
+                                map_id, player_uuid,
+                                row["kills"], row["deaths"], row["assists"],
+                                row["first_kills"], row["first_deaths"], row["traded_deaths"],
+                                row["adr"], row["kast_pct"], row["impact"], row["rating_2_0"]
+                            ))
+
+                    cur.execute("""
+                        UPDATE matches SET status = 'finished' WHERE match_id = %s;
+                    """, (match_uuid,))
+
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: cs2_postgres
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-cs2_tracker}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: cs2_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cs2_fastapi
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cs2_celery_worker
+    restart: unless-stopped
+    env_file: .env
+    shm_size: "2gb"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A worker.celery_app worker
+      --loglevel=info
+      --concurrency=2
+
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cs2_celery_beat
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A worker.celery_app beat
+      --loglevel=info
+
+volumes:
+  pgdata:
+  redisdata:
+
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+        curl \
+        ca-certificates \
+        unrar \
+        p7zip-full \
+        zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN mkdir -p /tmp/cs2_demos && chmod 777 /tmp/cs2_demos
+
+EXPOSE 8000
+
+import os
+import json
+from fastapi import FastAPI, HTTPException
+import redis
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from scraper import CS2Scraper
+from polymarket_matcher import PolymarketCS2Matcher
+from worker import task_sync_vrs, task_sync_upcoming_matches
+
+DATABASE_URL = os.getenv("DATABASE_URL", "dbname=cs2_tracker user=postgres password=postgres host=db")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+PROXY_URL = os.getenv("SCRAPER_PROXY_URL") or None
+
+app = FastAPI(title="Custom CS2 Telemetry & Analytics API", version="1.0.0")
+cache = redis.from_url(REDIS_URL, decode_responses=True)
+scraper = CS2Scraper(proxy_url=PROXY_URL)
+matcher = PolymarketCS2Matcher(DATABASE_URL)
+
+def get_db_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+@app.get("/v1/matches/upcoming")
+def fetch_upcoming_matches():
+    """Returns upcoming CS2 matches, cached for 5 minutes."""
+    cached = cache.get("matches:upcoming")
+    if cached:
+        return json.loads(cached)
+
+    matches = scraper.get_upcoming_matches()
+    cache.setex("matches:upcoming", 300, json.dumps(matches))
+    return matches
+
+@app.get("/v1/players/{steam_id}/rolling-form")
+def get_player_rolling_form(steam_id: int, maps_limit: int = 20):
+    """Computes a player's rolling metrics across their last N maps for ML features."""
+    cache_key = f"player:form:{steam_id}:{maps_limit}"
+    cached = cache.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    query = """
+        SELECT 
+            p.nickname,
+            COUNT(s.map_id) AS maps_sampled,
+            ROUND(AVG(s.rating_2_0), 3) AS avg_rating,
+            ROUND(AVG(s.adr), 2) AS avg_adr,
+            ROUND(AVG(s.kast_pct), 2) AS avg_kast,
+            ROUND(SUM(s.first_kills)::numeric / NULLIF(SUM(s.first_kills + s.first_deaths), 0), 3) AS opening_duel_win_rate
+        FROM (
+            SELECT ps.*
+            FROM player_map_stats ps
+            JOIN players pl ON pl.player_id = ps.player_id
+            JOIN match_maps mm ON mm.map_id = ps.map_id
+            JOIN matches m ON m.match_id = mm.match_id
+            WHERE pl.steam_id_64 = %s
+            ORDER BY m.scheduled_at DESC
+            LIMIT %s
+        ) s
+        JOIN players p ON p.player_id = s.player_id
+        GROUP BY p.nickname;
+    """
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (steam_id, maps_limit))
+            result = cur.fetchone()
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Player telemetry not found")
+
+    payload = dict(result)
+    cache.setex(cache_key, 1800, json.dumps(payload, default=float))
+    return payload
+
+@app.post("/v1/polymarket/scan-ev")
+def scan_polymarket_ev(model_probs: dict[int, float]):
+    """
+    Accepts a JSON payload of {hltv_match_id: model_prob_team_a}
+    Example: {"2376543": 0.64, "2376548": 0.41}
+    """
+    return matcher.sync_and_scan_edges(model_probs)
+
+@app.post("/v1/tasks/trigger-initial-sync")
+def trigger_initial_sync():
+    """Manually dispatches VRS + Upcoming Match sync jobs to Celery immediately."""
+    vrs_job = task_sync_vrs.delay()
+    matches_job = task_sync_upcoming_matches.delay()
+    return {
+        "message": "Background sync dispatched",
+        "vrs_task_id": vrs_job.id,
+        "matches_task_id": matches_job.id
+    }
+
+import json
+import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from rapidfuzz import fuzz
+from typing import Dict, List, Optional, Tuple
+
+GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
+
+TEAM_ALIASES = {
+    "natus vincere": "navi",
+    "faze clan": "faze",
+    "g2 esports": "g2",
+    "team vitality": "vitality",
+    "team spirit": "spirit",
+    "team liquid": "liquid",
+    "mouz": "mousesports",
+    "virtus.pro": "vp",
+    "eternal fire": "ef",
+    "the mongolz": "mongolz",
+}
+
+def normalize_team_name(name: str) -> str:
+    clean = name.lower().strip()
+    for prefix in ("team ", "esports", " clan", " gaming", " club"):
+        clean = clean.replace(prefix, "").strip()
+    return TEAM_ALIASES.get(name.lower().strip(), clean)
+
+
+class PolymarketCS2Matcher:
+    def __init__(self, db_dsn: str):
+        self.db_dsn = db_dsn
+        self.session = requests.Session()
+
+    def fetch_active_cs2_markets(self) -> List[Dict]:
+        """Queries Polymarket Gamma API for open Counter-Strike / CS2 markets."""
+        markets_found = []
+        for query_term in ("CS2", "Counter-Strike"):
+            resp = self.session.get(
+                f"{GAMMA_BASE_URL}/public-search",
+                params={"q": query_term},
+                timeout=15
+            )
+            if resp.status_code != 200:
+                continue
+
+            data = resp.json()
+            events = data.get("events", [])
+            for event in events:
+                if event.get("closed") or not event.get("active"):
+                    continue
+                for mkt in event.get("markets", []):
+                    if mkt.get("closed") or not mkt.get("active"):
+                        continue
+
+                    outcomes = json.loads(mkt.get("outcomes", "[]"))
+                    prices = [float(p) for p in json.loads(mkt.get("outcomePrices", "[]"))]
+                    clob_tokens = json.loads(mkt.get("clobTokenIds", "[]"))
+
+                    if len(outcomes) == 2 and len(prices) == 2:
+                        markets_found.append({
+                            "event_title": event.get("title", ""),
+                            "question": mkt.get("question", ""),
+                            "condition_id": mkt.get("conditionId"),
+                            "outcomes": outcomes,
+                            "prices": prices,
+                            "clob_token_ids": clob_tokens,
+                            "liquidity": float(mkt.get("liquidityNum", 0.0)),
+                            "end_date": mkt.get("endDate")
+                        })
+        return markets_found
+
+    def match_hltv_to_polymarket(
+        self, hltv_team_a: str, hltv_team_b: str, poly_markets: List[Dict]
+    ) -> Optional[Tuple[Dict, bool]]:
+        norm_a = normalize_team_name(hltv_team_a)
+        norm_b = normalize_team_name(hltv_team_b)
+
+        for mkt in poly_markets:
+            out_0 = normalize_team_name(mkt["outcomes"][0])
+            out_1 = normalize_team_name(mkt["outcomes"][1])
+
+            score_direct = min(
+                fuzz.token_set_ratio(norm_a, out_0),
+                fuzz.token_set_ratio(norm_b, out_1)
+            )
+            if score_direct >= 82:
+                return mkt, False
+
+            score_inverted = min(
+                fuzz.token_set_ratio(norm_a, out_1),
+                fuzz.token_set_ratio(norm_b, out_0)
+            )
+            if score_inverted >= 82:
+                return mkt, True
+
+        return None
+
+    @staticmethod
+    def evaluate_ev_and_kelly(
+        model_prob_a: float,
+        poly_price_a: float,
+        poly_price_b: float,
+        kelly_fraction: float = 0.25
+    ) -> Dict:
+        model_prob_b = 1.0 - model_prob_a
+
+        edge_a = model_prob_a - poly_price_a
+        ev_pct_a = (edge_a / poly_price_a) * 100.0 if poly_price_a > 0 else 0.0
+        kelly_a = (
+            kelly_fraction * (edge_a / (1.0 - poly_price_a))
+            if edge_a > 0 and poly_price_a < 1.0 else 0.0
+        )
+
+        edge_b = model_prob_b - poly_price_b
+        ev_pct_b = (edge_b / poly_price_b) * 100.0 if poly_price_b > 0 else 0.0
+        kelly_b = (
+            kelly_fraction * (edge_b / (1.0 - poly_price_b))
+            if edge_b > 0 and poly_price_b < 1.0 else 0.0
+        )
+
+        if edge_a >= edge_b and edge_a > 0:
+            return {
+                "recommended_side": "Team A",
+                "model_prob": round(model_prob_a, 4),
+                "market_implied_prob": round(poly_price_a, 4),
+                "raw_edge_pct": round(edge_a * 100, 2),
+                "ev_roi_pct": round(ev_pct_a, 2),
+                "quarter_kelly_bankroll_pct": round(kelly_a * 100, 2)
+            }
+        elif edge_b > 0:
+            return {
+                "recommended_side": "Team B",
+                "model_prob": round(model_prob_b, 4),
+                "market_implied_prob": round(poly_price_b, 4),
+                "raw_edge_pct": round(edge_b * 100, 2),
+                "ev_roi_pct": round(ev_pct_b, 2),
+                "quarter_kelly_bankroll_pct": round(kelly_b * 100, 2)
+            }
+        return {"recommended_side": "NO BET (Negative EV on both sides)"}
+
+    def sync_and_scan_edges(self, model_predictions: Dict[int, float]) -> List[Dict]:
+        poly_markets = self.fetch_active_cs2_markets()
+        opportunities = []
+
+        with psycopg2.connect(self.db_dsn, cursor_factory=RealDictCursor) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT m.match_id, m.hltv_match_id,
+                           ta.name AS team_a_name, tb.name AS team_b_name
+                    FROM matches m
+                    JOIN teams ta ON ta.team_id = m.team_a_id
+                    JOIN teams tb ON tb.team_id = m.team_b_id
+                    WHERE m.status = 'scheduled';
+                """)
+                upcoming_db = cur.fetchall()
+
+                for row in upcoming_db:
+                    matched = self.match_hltv_to_polymarket(
+                        row["team_a_name"], row["team_b_name"], poly_markets
+                    )
+                    if not matched:
+                        continue
+
+                    mkt, is_inverted = matched
+                    price_a = mkt["prices"][1] if is_inverted else mkt["prices"][0]
+                    price_b = mkt["prices"][0] if is_inverted else mkt["prices"][1]
+
+                    cur.execute("""
+                        UPDATE matches
+                        SET polymarket_condition_id = %s
+                        WHERE match_id = %s;
+                    """, (mkt["condition_id"], row["match_id"]))
+
+                    hltv_id = row["hltv_match_id"]
+                    if hltv_id in model_predictions:
+                        ev_analysis = self.evaluate_ev_and_kelly(
+                            model_prob_a=model_predictions[hltv_id],
+                            poly_price_a=price_a,
+                            poly_price_b=price_b
+                        )
+                        opportunities.append({
+                            "hltv_match_id": hltv_id,
+                            "matchup": f"{row['team_a_name']} vs {row['team_b_name']}",
+                            "condition_id": mkt["condition_id"],
+                            "liquidity_usd": mkt["liquidity"],
+                            **ev_analysis
+                        })
+
+        return opportunities
+
+# CS2 Telemetry, VRS & Polymarket +EV Engine
+
+A self-hosted Counter-Strike 2 esports data pipeline and analytics API inspired by Cito. Combines Cloudflare-bypassing match scrapers, tick-accurate `.dem` replay parsing (`demoparser2`), official Valve Regional Standings (VRS) synchronization, and Polymarket Gamma API +EV edge detection.
+
+## Architecture
+
+* **PostgreSQL 16**: Canonical entity resolution across HLTV IDs, 64-bit SteamIDs, Valve VRS standings, map vetoes, and Polymarket `conditionId`s.
+* **FastAPI + Redis**: High-speed cached REST endpoints (`/v1/matches/upcoming`, `/v1/players/{steam_id}/rolling-form`, `/v1/polymarket/scan-ev`).
+* **Celery + Celery Beat**: Automated background workers that sync Valve's GitHub VRS standings (every 6h), upcoming matches & Polymarket odds (every 15m), and `.dem` replay archives (every 20m).
+
+## Quick Start
+
+1. **Copy the environment template:**
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Build and launch the stack:**
+   ```bash
+   docker compose up -d --build
+   ```
+
+3. **Trigger the initial database sync:**
+   ```bash
+   curl -X POST http://localhost:8000/v1/tasks/trigger-initial-sync
+   ```
+
+4. **Explore the Swagger API docs:**
+   Open `http://localhost:8000/docs` in your browser.
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+psycopg2-binary>=2.9.10
+redis>=5.2.0
+celery>=5.4.0
+curl_cffi>=0.7.3
+beautifulsoup4>=4.12.3
+lxml>=5.3.0
+demoparser2>=0.38.0
+pandas>=2.2.3
+numpy>=2.1.0
+rapidfuzz>=3.10.0
+patool>=3.0.0
+zstandard>=0.23.0
+requests>=2.32.3
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Canonical Teams & Entity Resolution
+CREATE TABLE teams (
+    team_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(120) NOT NULL,
+    hltv_id INTEGER UNIQUE,
+    vrs_rank INTEGER,
+    vrs_points INTEGER,
+    hltv_rank INTEGER,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 2. Canonical Players (Anchored by 64-bit SteamID)
+CREATE TABLE players (
+    player_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    steam_id_64 BIGINT UNIQUE NOT NULL,
+    hltv_id INTEGER UNIQUE,
+    nickname VARCHAR(80) NOT NULL,
+    current_team_id UUID REFERENCES teams(team_id)
+);
+
+-- 3. Matches & Market Mapping
+CREATE TABLE matches (
+    match_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    hltv_match_id INTEGER UNIQUE NOT NULL,
+    event_name VARCHAR(255),
+    team_a_id UUID REFERENCES teams(team_id),
+    team_b_id UUID REFERENCES teams(team_id),
+    best_of SMALLINT NOT NULL DEFAULT 3,
+    status VARCHAR(20) DEFAULT 'scheduled', -- scheduled, live, finished
+    scheduled_at TIMESTAMPTZ NOT NULL,
+    polymarket_condition_id VARCHAR(120)
+);
+
+-- 4. Map Veto Sequence (Critical for pre-match prediction models)
+CREATE TABLE match_vetoes (
+    veto_id SERIAL PRIMARY KEY,
+    match_id UUID REFERENCES matches(match_id) ON DELETE CASCADE,
+    step_num SMALLINT NOT NULL,
+    team_id UUID REFERENCES teams(team_id),
+    action VARCHAR(10) NOT NULL, -- 'removed', 'picked', 'left_over'
+    map_name VARCHAR(30) NOT NULL
+);
+
+-- 5. Individual Maps Played
+CREATE TABLE match_maps (
+    map_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    match_id UUID REFERENCES matches(match_id) ON DELETE CASCADE,
+    map_number SMALLINT NOT NULL,
+    map_name VARCHAR(30) NOT NULL,
+    team_a_score SMALLINT DEFAULT 0,
+    team_b_score SMALLINT DEFAULT 0,
+    team_a_ct_rounds SMALLINT DEFAULT 0,
+    team_a_t_rounds SMALLINT DEFAULT 0
+);
+
+-- 6. Granular Player Map Stats (Populated via HLTV or Demo Parser)
+CREATE TABLE player_map_stats (
+    stat_id SERIAL PRIMARY KEY,
+    map_id UUID REFERENCES match_maps(map_id) ON DELETE CASCADE,
+    player_id UUID REFERENCES players(player_id),
+    team_id UUID REFERENCES teams(team_id),
+    kills SMALLINT NOT NULL,
+    deaths SMALLINT NOT NULL,
+    assists SMALLINT NOT NULL,
+    first_kills SMALLINT DEFAULT 0,
+    first_deaths SMALLINT DEFAULT 0,
+    traded_deaths SMALLINT DEFAULT 0,
+    adr NUMERIC(5,2) NOT NULL,
+    kast_pct NUMERIC(5,2) NOT NULL,
+    impact_rating NUMERIC(4,2) NOT NULL,
+    rating_2_0 NUMERIC(4,2) NOT NULL,
+    UNIQUE(map_id, player_id)
+);
+
+CREATE INDEX idx_player_stats_lookup ON player_map_stats(player_id, map_id);
+CREATE INDEX idx_matches_scheduled ON matches(scheduled_at) WHERE status = 'scheduled';
+
+import re
+from typing import Dict, List, Optional
+from curl_cffi import requests
+from bs4 import BeautifulSoup
+
+class CS2Scraper:
+    def __init__(self, proxy_url: Optional[str] = None):
+        # Impersonate modern Chrome TLS/JA3 fingerprint to bypass Cloudflare
+        self.session = requests.Session(impersonate="chrome124")
+        if proxy_url:
+            self.session.proxies = {"http": proxy_url, "https": proxy_url}
+        self.base_url = "https://www.hltv.org"
+
+    def _get_soup(self, path: str) -> BeautifulSoup:
+        url = f"{self.base_url}{path}" if path.startswith("/") else path
+        resp = self.session.get(url, timeout=15)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Blocked or failed ({resp.status_code}) on {url}")
+        return BeautifulSoup(resp.text, "lxml")
+
+    def get_upcoming_matches(self) -> List[Dict]:
+        """Scrapes upcoming match schedule, HLTV match IDs, and team IDs."""
+        soup = self._get_soup("/matches")
+        matches = []
+
+        for match_el in soup.select(".upcomingMatch"):
+            link_el = match_el.select_one("a.match")
+            if not link_el:
+                continue
+
+            href = link_el.get("href", "")
+            match_id_search = re.search(r"/matches/(\d+)/", href)
+            if not match_id_search:
+                continue
+
+            hltv_match_id = int(match_id_search.group(1))
+            unix_ms = match_el.get("data-zonedgrouping-entry-unix")
+            team1 = match_el.select_one(".matchTeam.team1 .matchTeamName")
+            team2 = match_el.select_one(".matchTeam.team2 .matchTeamName")
+            event = match_el.select_one(".matchEventName")
+            meta = match_el.select_one(".matchMeta")
+
+            matches.append({
+                "hltv_match_id": hltv_match_id,
+                "url": f"{self.base_url}{href}",
+                "scheduled_unix": int(unix_ms) // 1000 if unix_ms else None,
+                "team_a": team1.text.strip() if team1 else "TBD",
+                "team_b": team2.text.strip() if team2 else "TBD",
+                "event": event.text.strip() if event else "Unknown",
+                "best_of": meta.text.strip() if meta else "bo1"
+            })
+
+        return matches
+
+    def get_match_details_and_veto(self, match_url: str) -> Dict:
+        """Extracts map vetoes, demo download ID, and map stats links."""
+        soup = self._get_soup(match_url)
+        
+        # 1. Parse Map Veto Box
+        vetoes = []
+        veto_boxes = soup.select(".standard-box.veto-box .padding > div")
+        for idx, div in enumerate(veto_boxes, start=1):
+            text = div.text.strip()
+            vetoes.append({"step": idx, "raw_text": text})
+
+        # 2. Extract Demo Download Link (if match is finished)
+        demo_link_el = soup.select_one("a[data-demo-link]")
+        demo_path = demo_link_el.get("data-demo-link") if demo_link_el else None
+
+        # 3. Extract Map Scores
+        maps_played = []
+        for map_holder in soup.select(".mapholder"):
+            map_name_el = map_holder.select_one(".mapname")
+            scores = map_holder.select(".results-team-score")
+            if map_name_el and len(scores) == 2:
+                maps_played.append({
+                    "map_name": map_name_el.text.strip(),
+                    "team_a_score": scores[0].text.strip(),
+                    "team_b_score": scores[1].text.strip(),
+                })
+
+        return {
+            "vetoes": vetoes,
+            "demo_url": f"{self.base_url}{demo_path}" if demo_path else None,
+            "maps": maps_played
+        }
+
+import re
+import requests
+import psycopg2
+from typing import List, Dict
+
+GITHUB_API_URL = (
+    "https://api.github.com/repos/ValveSoftware/"
+    "counter-strike_regional_standings/contents/live/2026"
+)
+
+class VRSSyncWorker:
+    def __init__(self, db_dsn: str):
+        self.db_dsn = db_dsn
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "CS2-Data-Tracker-VRS-Sync"
+        })
+
+    def get_latest_global_markdown_url(self) -> str:
+        """Finds the newest standings_global_YYYY_MM_DD.md file in Valve's repo."""
+        resp = self.session.get(GITHUB_API_URL, timeout=15)
+        resp.raise_for_status()
+        files = resp.json()
+
+        global_files = [
+            f for f in files
+            if f["name"].startswith("standings_global_") and f["name"].endswith(".md")
+        ]
+        if not global_files:
+            raise RuntimeError("No global VRS standings files found in repository.")
+
+        latest_file = sorted(global_files, key=lambda x: x["name"])[-1]
+        return latest_file["download_url"]
+
+    def parse_vrs_markdown(self, md_text: str) -> List[Dict]:
+        """
+        Parses Valve's Markdown table format:
+        | Standing | Points | Team Name | Roster | ...
+        """
+        standings = []
+        row_pattern = re.compile(
+            r"^\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|"
+        )
+
+        for line in md_text.splitlines():
+            match = row_pattern.match(line.strip())
+            if match:
+                rank = int(match.group(1))
+                points = int(match.group(2))
+                team_name = match.group(3).strip()
+                roster_str = match.group(4).strip()
+                roster = [p.strip() for p in roster_str.split(",") if p.strip()]
+
+                standings.append({
+                    "vrs_rank": rank,
+                    "vrs_points": points,
+                    "team_name": team_name,
+                    "roster": roster
+                })
+        return standings
+
+    def sync_to_postgres(self) -> int:
+        raw_url = self.get_latest_global_markdown_url()
+        md_resp = self.session.get(raw_url, timeout=15)
+        md_resp.raise_for_status()
+
+        parsed_rows = self.parse_vrs_markdown(md_resp.text)
+        if not parsed_rows:
+            return 0
+
+        with psycopg2.connect(self.db_dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    ALTER TABLE teams 
+                    ADD COLUMN IF NOT EXISTS vrs_points INTEGER;
+                """)
+
+                for row in parsed_rows:
+                    cur.execute("""
+                        UPDATE teams
+                        SET vrs_rank = %s,
+                            vrs_points = %s,
+                            updated_at = NOW()
+                        WHERE LOWER(name) = LOWER(%s);
+                    """, (row["vrs_rank"], row["vrs_points"], row["team_name"]))
+
+                    if cur.rowcount == 0:
+                        cur.execute("""
+                            INSERT INTO teams (name, vrs_rank, vrs_points)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT DO NOTHING;
+                        """, (row["team_name"], row["vrs_rank"], row["vrs_points"]))
+
+        return len(parsed_rows)
+
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from celery import Celery
+from celery.schedules import crontab
+
+from scraper import CS2Scraper
+from vrs_sync import VRSSyncWorker
+from demo_pipeline import DemoIngestionPipeline
+from polymarket_matcher import PolymarketCS2Matcher
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+DATABASE_URL = os.getenv("DATABASE_URL", "dbname=cs2_tracker user=postgres password=postgres host=localhost")
+PROXY_URL = os.getenv("SCRAPER_PROXY_URL") or None
+
+celery_app = Celery("cs2_tasks", broker=REDIS_URL, backend=REDIS_URL)
+
+celery_app.conf.update(
+    timezone="UTC",
+    enable_utc=True,
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+    worker_prefetch_multiplier=1,
+)
+
+celery_app.conf.beat_schedule = {
+    "sync-vrs-rankings-every-6h": {
+        "task": "worker.task_sync_vrs",
+        "schedule": crontab(minute=0, hour="*/6"),
+    },
+    "sync-upcoming-matches-every-15m": {
+        "task": "worker.task_sync_upcoming_matches",
+        "schedule": crontab(minute="*/15"),
+    },
+    "ingest-finished-match-demos-every-20m": {
+        "task": "worker.task_process_pending_demos",
+        "schedule": crontab(minute="*/20"),
+    },
+}
+
+
+@celery_app.task(name="worker.task_sync_vrs")
+def task_sync_vrs():
+    syncer = VRSSyncWorker(DATABASE_URL)
+    updated_count = syncer.sync_to_postgres()
+    return {"status": "ok", "vrs_teams_synced": updated_count}
+
+
+@celery_app.task(name="worker.task_sync_upcoming_matches")
+def task_sync_upcoming_matches():
+    scraper = CS2Scraper(proxy_url=PROXY_URL)
+    upcoming = scraper.get_upcoming_matches()
+
+    inserted = 0
+    with psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor) as conn:
+        with conn.cursor() as cur:
+            for m in upcoming:
+                if m["team_a"] == "TBD" or m["team_b"] == "TBD" or not m["scheduled_unix"]:
+                    continue
+
+                team_uuids = []
+                for t_name in (m["team_a"], m["team_b"]):
+                    cur.execute("SELECT team_id FROM teams WHERE LOWER(name) = LOWER(%s);", (t_name,))
+                    row = cur.fetchone()
+                    if row:
+                        team_uuids.append(row["team_id"])
+                    else:
+                        cur.execute(
+                            "INSERT INTO teams (name) VALUES (%s) RETURNING team_id;",
+                            (t_name,)
+                        )
+                        team_uuids.append(cur.fetchone()["team_id"])
+
+                bo_num = int("".join(filter(str.isdigit, m["best_of"])) or 1)
+
+                cur.execute("""
+                    INSERT INTO matches (
+                        hltv_match_id, event_name, team_a_id, team_b_id,
+                        best_of, status, scheduled_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, 'scheduled', to_timestamp(%s)
+                    )
+                    ON CONFLICT (hltv_match_id) DO UPDATE
+                    SET scheduled_at = EXCLUDED.scheduled_at,
+                        team_a_id = EXCLUDED.team_a_id,
+                        team_b_id = EXCLUDED.team_b_id;
+                """, (
+                    m["hltv_match_id"], m["event"],
+                    team_uuids[0], team_uuids[1],
+                    bo_num, m["scheduled_unix"]
+                ))
+                inserted += 1
+
+    matcher = PolymarketCS2Matcher(DATABASE_URL)
+    matcher.sync_and_scan_edges(model_predictions={})
+    return {"status": "ok", "matches_upserted": inserted}
+
+
+@celery_app.task(name="worker.task_process_pending_demos")
+def task_process_pending_demos():
+    scraper = CS2Scraper(proxy_url=PROXY_URL)
+    pipeline = DemoIngestionPipeline(DATABASE_URL, proxy_url=PROXY_URL)
+    processed = 0
+
+    with psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT match_id, hltv_match_id
+                FROM matches
+                WHERE status != 'finished'
+                  AND scheduled_at < NOW() - INTERVAL '90 minutes'
+                ORDER BY scheduled_at DESC
+                LIMIT 5;
+            """)
+            candidates = cur.fetchall()
+
+    for match in candidates:
+        match_url = f"https://www.hltv.org/matches/{match['hltv_match_id']}/-"
+        try:
+            details = scraper.get_match_details_and_veto(match_url)
+            if details.get("demo_url"):
+                pipeline.process_match_demos(str(match["match_id"]), details["demo_url"])
+                processed += 1
+        except Exception as exc:
+            print(f"Skipping match {match['hltv_match_id']} demo check: {exc}")
+
+    return {"status": "ok", "demos_processed": processed}
